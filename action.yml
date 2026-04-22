@@ -2,8 +2,8 @@ name: "Sekrd Security Scan"
 author: "Sekrd"
 description: "Run a Sekrd deep security scan against your deployed site from CI/CD. Uploads SARIF for GitHub Code Scanning."
 branding:
-  icon: "shield"
-  color: "green"
+  icon: "lock"
+  color: "purple"
 
 inputs:
   url:
