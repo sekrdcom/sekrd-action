@@ -1,3 +1,5 @@
+[![Sekrd on the GitHub Marketplace](https://img.shields.io/badge/Marketplace-Sekrd%20Deep%20Security%20Scanner-2A2F34?logo=github&logoColor=white)](https://github.com/marketplace/actions/sekrd-security-scan)
+
 # Sekrd GitHub Action
 
 Run a [Sekrd](https://sekrd.com) deep security scan against your deployed site
