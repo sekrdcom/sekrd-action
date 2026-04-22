@@ -1,0 +1,181 @@
+name: "Sekrd Security Scan"
+author: "Sekrd"
+description: "Run a Sekrd deep security scan against your deployed site from CI/CD. Uploads SARIF for GitHub Code Scanning."
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  url:
+    description: "The URL to scan. Must be reachable from the public internet (preview deploys work — pass the Vercel / Netlify preview URL)."
+    required: true
+  api-key:
+    description: "Your Sekrd API key. Get one at https://sekrd.com/dashboard/settings. Store as GitHub secret (e.g. SEKRD_API_KEY)."
+    required: true
+  scan-type:
+    description: "Scan type: 'deep' (default, all 15 providers, Pro tier required) or 'free' (3 providers, 3 findings shown, free tier)."
+    required: false
+    default: "deep"
+  fail-on:
+    description: "Fail the workflow if the scan returns this severity or worse. One of: critical, high, medium, low, never. Default: critical."
+    required: false
+    default: "critical"
+  upload-sarif:
+    description: "Upload the SARIF report to GitHub Code Scanning. Requires the workflow job to have `security-events: write` permission."
+    required: false
+    default: "true"
+  comment-on-pr:
+    description: "Post the score + top findings as a PR comment. Requires `pull-requests: write`."
+    required: false
+    default: "true"
+
+outputs:
+  scan-id:
+    description: "The Sekrd scan ID, useful for deep-linking to the report."
+  score:
+    description: "Final score 0-100 (higher = more secure)."
+  verdict:
+    description: "Launch verdict: SHIP, BLOCK_GRACE, or BLOCK."
+  critical-count:
+    description: "Number of critical findings."
+  high-count:
+    description: "Number of high findings."
+  report-url:
+    description: "Public URL of the full HTML report."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Submit scan
+      id: submit
+      shell: bash
+      run: |
+        set -euo pipefail
+        RESP=$(curl -sS --fail-with-body \
+          -X POST \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"url\":\"${{ inputs.url }}\"}" \
+          "https://api.sekrd.com/api/v1/scan/${{ inputs.scan-type }}")
+        SCAN_ID=$(echo "$RESP" | python -c "import sys,json; print(json.load(sys.stdin)['scan_id'])")
+        echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+        echo "::notice title=Sekrd scan submitted::scan_id=$SCAN_ID"
+
+    - name: Poll for completion
+      id: poll
+      shell: bash
+      run: |
+        set -euo pipefail
+        for i in $(seq 1 30); do
+          sleep 15
+          R=$(curl -sS -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            "https://api.sekrd.com/api/v1/scans/${{ steps.submit.outputs.scan_id }}")
+          STATUS=$(echo "$R" | python -c "import sys,json; print(json.load(sys.stdin).get('status','?'))")
+          echo "poll attempt $i: $STATUS"
+          if [ "$STATUS" = "complete" ] || [ "$STATUS" = "failed" ]; then
+            break
+          fi
+        done
+        echo "$R" > sekrd-scan.json
+
+    - name: Extract outputs + render summary
+      shell: bash
+      run: |
+        set -euo pipefail
+        python - <<'PY'
+        import json, os
+        d = json.load(open('sekrd-scan.json'))
+        score = d.get('score', 0)
+        verdict = d.get('launch_verdict', 'UNKNOWN')
+        findings = d.get('findings', []) or []
+        crit = sum(1 for f in findings if f.get('severity') == 'critical')
+        high = sum(1 for f in findings if f.get('severity') == 'high')
+        med  = sum(1 for f in findings if f.get('severity') == 'medium')
+        low  = sum(1 for f in findings if f.get('severity') == 'low')
+        report_url = f"https://sekrd.com/report/{d.get('scan_id','')}"
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"score={score}\n")
+            f.write(f"verdict={verdict}\n")
+            f.write(f"critical-count={crit}\n")
+            f.write(f"high-count={high}\n")
+            f.write(f"report-url={report_url}\n")
+        # Render the workflow summary
+        sev_emoji = {'critical':'🔴','high':'🟠','medium':'🟡','low':'🔵','info':'⚪'}
+        lines = [f"# Sekrd security scan — {verdict}", ""]
+        lines.append(f"**Score: {score} / 100**  ·  **Verdict: {verdict}**  ·  [Full report]({report_url})")
+        lines.append("")
+        lines.append(f"| Severity | Count |")
+        lines.append(f"|---|---:|")
+        lines.append(f"| 🔴 critical | {crit} |")
+        lines.append(f"| 🟠 high     | {high} |")
+        lines.append(f"| 🟡 medium   | {med} |")
+        lines.append(f"| 🔵 low      | {low} |")
+        lines.append("")
+        if crit + high > 0:
+            lines.append(f"## Critical + High findings")
+            lines.append("")
+            for f_ in findings:
+                if f_.get('severity') not in ('critical','high'): continue
+                lines.append(f"- {sev_emoji.get(f_.get('severity',''),'')} **{f_.get('title','?')}** (`{f_.get('rule_id','?')}`, CWE `{f_.get('cwe','—')}`)")
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+        PY
+
+    - name: Download SARIF
+      if: inputs.upload-sarif == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -sS -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          "https://api.sekrd.com/api/v1/scans/${{ steps.submit.outputs.scan_id }}/sarif" \
+          > sekrd.sarif
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: sekrd.sarif
+
+    - name: Comment on PR
+      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      env:
+        SCORE: ${{ steps.poll.outputs.score }}
+        VERDICT: ${{ steps.poll.outputs.verdict }}
+        CRIT: ${{ steps.poll.outputs.critical-count }}
+        HIGH: ${{ steps.poll.outputs.high-count }}
+        REPORT: ${{ steps.poll.outputs.report-url }}
+      with:
+        script: |
+          const { SCORE, VERDICT, CRIT, HIGH, REPORT } = process.env;
+          const emoji = VERDICT === 'SHIP' ? '🟢' : VERDICT === 'BLOCK' ? '🔴' : '🟡';
+          const body = [
+            `## ${emoji} Sekrd security scan — ${VERDICT}`,
+            ``,
+            `**Score: ${SCORE} / 100**`,
+            ``,
+            `- 🔴 **${CRIT}** critical`,
+            `- 🟠 **${HIGH}** high`,
+            ``,
+            `[Full report on sekrd.com →](${REPORT})`,
+          ].join('\n');
+          await github.rest.issues.createComment({
+            ...context.repo,
+            issue_number: context.issue.number,
+            body,
+          });
+
+    - name: Fail on configured severity threshold
+      shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        CRIT: ${{ steps.poll.outputs.critical-count }}
+        HIGH: ${{ steps.poll.outputs.high-count }}
+      run: |
+        set -euo pipefail
+        case "$FAIL_ON" in
+          critical) [ "$CRIT" -gt 0 ] && { echo "::error::$CRIT critical findings — failing build"; exit 1; } ;;
+          high)     [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ] && { echo "::error::Critical or high findings — failing build"; exit 1; } ;;
+          never)    exit 0 ;;
+        esac
+        exit 0
