@@ -51,15 +51,20 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        case "${{ inputs.scan-type }}" in
+          free)  ENDPOINT="url" ;;
+          deep)  ENDPOINT="deep" ;;
+          *)     echo "::error::Invalid scan-type '${{ inputs.scan-type }}'. Use 'free' or 'deep'."; exit 2 ;;
+        esac
         RESP=$(curl -sS --fail-with-body \
           -X POST \
           -H "Authorization: Bearer ${{ inputs.api-key }}" \
           -H "Content-Type: application/json" \
           -d "{\"url\":\"${{ inputs.url }}\"}" \
-          "https://api.sekrd.com/api/v1/scan/${{ inputs.scan-type }}")
+          "https://api.sekrd.com/api/v1/scan/$ENDPOINT")
         SCAN_ID=$(echo "$RESP" | python -c "import sys,json; print(json.load(sys.stdin)['scan_id'])")
         echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
-        echo "::notice title=Sekrd scan submitted::scan_id=$SCAN_ID"
+        echo "::notice title=Sekrd scan submitted::scan_id=$SCAN_ID endpoint=$ENDPOINT"
 
     - name: Poll for completion
       id: poll
