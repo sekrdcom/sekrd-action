@@ -51,17 +51,49 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # Translate user-friendly scan-type to the API endpoint.
+        # Prior v1.0.1 passed scan-type directly into the URL which
+        # 404'd for scan-type=free (real endpoint is /scan/url).
         case "${{ inputs.scan-type }}" in
           free)  ENDPOINT="url" ;;
           deep)  ENDPOINT="deep" ;;
           *)     echo "::error::Invalid scan-type '${{ inputs.scan-type }}'. Use 'free' or 'deep'."; exit 2 ;;
         esac
-        RESP=$(curl -sS --fail-with-body \
-          -X POST \
-          -H "Authorization: Bearer ${{ inputs.api-key }}" \
-          -H "Content-Type: application/json" \
-          -d "{\"url\":\"${{ inputs.url }}\"}" \
-          "https://api.sekrd.com/api/v1/scan/$ENDPOINT")
+
+        # Submit with backoff on 429 (rate-limited). Free tier has
+        # per-IP + per-key submission caps; a CI runner bursting
+        # multiple scans can trip these. 5 retries with 30/60/90/
+        # 120/150s backoff — bail loud past that.
+        SUBMIT_URL="https://api.sekrd.com/api/v1/scan/$ENDPOINT"
+        RESP=""
+        for attempt in 1 2 3 4 5; do
+          HTTP_CODE=$(curl -sS -o /tmp/sekrd_resp.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\":\"${{ inputs.url }}\"}" \
+            "$SUBMIT_URL")
+          case "$HTTP_CODE" in
+            202|200)
+              RESP=$(cat /tmp/sekrd_resp.json)
+              break
+              ;;
+            429)
+              WAIT=$((attempt * 30))
+              echo "::warning::Sekrd API rate-limited (429). Waiting ${WAIT}s before retry $attempt/5"
+              sleep "$WAIT"
+              ;;
+            *)
+              echo "::error::Sekrd API returned HTTP $HTTP_CODE:"
+              cat /tmp/sekrd_resp.json
+              exit 1
+              ;;
+          esac
+        done
+        if [ -z "$RESP" ]; then
+          echo "::error::Sekrd API still 429 after 5 retries. Check plan/key rate limits."
+          exit 1
+        fi
         SCAN_ID=$(echo "$RESP" | python -c "import sys,json; print(json.load(sys.stdin)['scan_id'])")
         echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
         echo "::notice title=Sekrd scan submitted::scan_id=$SCAN_ID endpoint=$ENDPOINT"
